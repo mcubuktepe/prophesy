@@ -16,6 +16,7 @@ from prophesy.sampling.sample_generator import SampleGenerator
 
 from heuristic_optimization.optimizers import ParticleSwarmOptimizer
 from heuristic_optimization.util.position_initializers import clamped_gaussian_distribution
+import time
 
 
 def _coords_to_rational_point(coords):
@@ -114,6 +115,9 @@ class ParticleSwarmSampleGenerator(SampleGenerator):
         super().__init__(sampler, parameters, region)
         self.score_fct = score_fct
         self.latest_sampling_result = None
+        self._global_timer=time.time()
+        self._timeout=1200
+
 
         self.bounds = _bounds(region, parameters)
 
@@ -150,6 +154,10 @@ class ParticleSwarmSampleGenerator(SampleGenerator):
         """Does what IterativeOptimizer.optimize does but yields stuff."""
         yield self.latest_sampling_result  # initial spawn
         while not self.pso.stop():
+            if time.time()-self._global_timer>self._timeout:
+                print("Time out has elapsed after {} seconds:".format(self._timeout))
+                yield self.latest_sampling_result
+                return
             self.pso.iteration += 1
             self.pso.iterate()
             #print("{}: {}".format(self.pso.iteration, float(self.pso.historic_best_score)))

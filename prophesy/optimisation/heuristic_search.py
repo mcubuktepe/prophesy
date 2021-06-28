@@ -3,7 +3,7 @@ from prophesy.data.samples import InstantiationResult
 import prophesy.adapter.pycarl as pc
 import logging
 logger = logging.getLogger(__name__)
-
+import time
 class ModelOptimizer:
     """Finds arg-{min,max} of PCTL property values."""
 
@@ -18,6 +18,7 @@ class ModelOptimizer:
         self._threshold = None
         self._iterations = 0
         self._region = region
+        self._timeout=1200
 
     def set_termination_threshold(self, threshold):
         self._threshold = threshold
@@ -52,6 +53,7 @@ class ModelOptimizer:
 
     def search(self):
         """Run PSO and return best result."""
+        self._global_timer=time.time()
         if not self._pso_sample_gen:
             self._initialise()
         for _ in self._pso_sample_gen:
@@ -64,12 +66,16 @@ class ModelOptimizer:
                                                self._parameters)
                 logger.debug("Comparing {} with {}".format(value, self._threshold))
                 if self._direction == "max":
-                    if value > self._threshold:
+                    if value > float(self._threshold):
                         break
                 if self._direction == "min":
-                    if value < self._threshold:
+                    if value < float(self._threshold):
                         break
             else:
                 logger.debug("PSO has not converged, start a new round of {} samples".format(self._nr_particles))
+            if time.time()-self._global_timer>self._timeout:
+                print("Time out has elapsed after {} seconds:".format(self._timeout))
+                return InstantiationResult.from_point(self._pso_sample_gen.pso.historic_best_position, self.score(None, self._pso_sample_gen.pso.historic_best_score), self._parameters)
+
 
         return InstantiationResult.from_point(self._pso_sample_gen.pso.historic_best_position, self.score(None, self._pso_sample_gen.pso.historic_best_score), self._parameters)

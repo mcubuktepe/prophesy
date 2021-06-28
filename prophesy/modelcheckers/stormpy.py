@@ -232,6 +232,16 @@ class StormpyModelChecker(ParametricProbabilisticModelChecker):
             self._states_before_bisim = self._model.nr_states
             self._transitions_before_bisim = self._model.nr_transitions
             logger.debug("Built a model with {} states and {} transitions".format(self._states_before_bisim, self._transitions_before_bisim))
+            nr_action = 0
+
+            for state in self._model.states:
+
+                for action in state.actions:
+                    nr_action = nr_action + 1
+            logger.debug(
+                "Bisimulation yields model with {} states, {} actions and {} transitions".format(self._model.nr_states,
+                                                                                                 nr_action,
+                                                                                                 self._model.nr_transitions))
 
             if self._transform_from_continuous:
                 logger.info("Transform to discrete time model")
@@ -240,10 +250,20 @@ class StormpyModelChecker(ParametricProbabilisticModelChecker):
                     str(self.pctlformula[0].raw_formula)))]
 
             self._model.reduce_to_state_based_rewards()
-            if self.bisimulation == stormpy.BisimulationType.STRONG or self.bisimulation == stormpy.BisimulationType.WEAK:
-                logger.info("Perform bisimulation")
-                self._model = stormpy.perform_bisimulation(self._model, self.pctlformula, self.bisimulation)
-                logger.debug("Bisimulation yields model with {} states and {} transitions".format(self._model.nr_states, self._model.nr_transitions))
+            # if self.bisimulation == stormpy.BisimulationType.STRONG or self.bisimulation == stormpy.BisimulationType.WEAK:
+            #     logger.info("Perform bisimulation")
+            #     self._model = stormpy.perform_bisimulation(self._model, self.pctlformula, self.bisimulation)
+            #     nr_action=0
+            #     for state in self._model.states:
+            #
+            #         for action in state.actions:
+            #             nr_action = nr_action + 1
+            #     logger.debug(
+            #         "Bisimulation yields model with {} states, {} actions and {} transitions".format(
+            #             self._model.nr_states,
+            #             nr_action,
+            #             self._model.nr_transitions))
+
 
             if self.simplification:
                 if self._model.model_type in [stormpy.storage.ModelType.CTMC, stormpy.storage.ModelType.MA]:
@@ -412,23 +432,49 @@ class StormpyModelChecker(ParametricProbabilisticModelChecker):
         logger.debug("Call stormpy for sampling")
         parameter_mapping = self.get_parameter_mapping(sample_points[0].get_parameters())
         samples = InstantiationResultDict({p: self.sample_single_point(p, parameter_mapping) for p in sample_points})
+        #print(samples)
         logger.debug("Sampling with stormpy successfully finished")
         return samples
 
-    def sample_single_point(self, parameter_instantiation, parameter_mapping):
-        # Instantiate point and check result
-        #model_instantiator = self.get_model_instantiator()
-        model_instatiation_checker = self.get_model_instantiation_checker()
+    # def sample_single_point(self, parameter_instantiation, parameter_mapping):
+    #     # Instantiate point and check result
+    #     #model_instantiator = self.get_model_instantiator()
+    #     model_instatiation_checker = self.get_model_instantiation_checker()
+    #     point = {parameter_mapping[parameter]: pc.convert_to_storm_type(val) for parameter, val in
+    #              parameter_instantiation.items() if parameter_mapping[parameter] is not None}
+    #     start = time.time()
+    #     #instantiated_model = model_instantiator.instantiate(point)
+    #     self._environment.solver_environment.set_linear_equation_solver_type(stormpy.EquationSolverType.eigen)
+    #     print(point)
+    #     print(len(point))
+    #     print(model_instatiation_checker.check(self._environment,point))
+    #     result = pc.convert_from_storm_type(model_instatiation_checker.check(self._environment,point).at(self.get_model().initial_states[0]))
+    #     #result = pc.convert_from_storm_type(
+    #     #    stormpy.model_checking(instantiated_model, self.pctlformula[0]).at(instantiated_model.initial_states[0]))
+    #     self._instantiated_model_checking_time += time.time() - start
+    #     self._samples_checked += 1
+    #     return result
+
+    def sample_single_point(self, parameter_instantiation, parameter_mapping=None):
+        if parameter_mapping is None:
+            parameter_mapping = self.get_parameter_mapping(parameter_instantiation.get_parameters())
+        model_instantiator = self.get_model_instantiator()
         point = {parameter_mapping[parameter]: pc.convert_to_storm_type(val) for parameter, val in
                  parameter_instantiation.items() if parameter_mapping[parameter] is not None}
         start = time.time()
-        #instantiated_model = model_instantiator.instantiate(point)
-        result = pc.convert_from_storm_type(model_instatiation_checker.check(self._environment,point).at(self.get_model().initial_states[0]))
-        #result = pc.convert_from_storm_type(
-        #    stormpy.model_checking(instantiated_model, self.pctlformula[0]).at(instantiated_model.initial_states[0]))
+        instantiated_model = model_instantiator.instantiate(point)
+        env = stormpy.Environment()
+        env.solver_environment.set_linear_equation_solver_type(stormpy.EquationSolverType.eigen)
+        #env.solver_environment.minmax_solver_environment.method = stormpy.MinMaxMethod.policy_iteration
+        #env.solver_environment.native_solver_environment.precision = stormpy.Rational("0.01")
+        #print(env)
+        #env.solver_environment.native_solver_environment.method = stormpy.NativeLinearEquationSolverMethod.sound_value_iteration
+        result = stormpy.model_checking(instantiated_model, self.pctlformula[0],environment=env)
         self._instantiated_model_checking_time += time.time() - start
         self._samples_checked += 1
-        return result
+        initial_state=instantiated_model.initial_states[0]
+        #print(result.at(initial_state))
+        return result.at(initial_state)
 
     def mc_single_point(self, parameter_instantiation, parameter_mapping=None):
         if parameter_mapping is None:
@@ -438,7 +484,10 @@ class StormpyModelChecker(ParametricProbabilisticModelChecker):
                  parameter_instantiation.items() if parameter_mapping[parameter] is not None}
         start = time.time()
         instantiated_model = model_instantiator.instantiate(point)
-        result = stormpy.model_checking(instantiated_model, self.pctlformula[0])
+        env = stormpy.Environment()
+        env.solver_environment.set_linear_equation_solver_type(stormpy.EquationSolverType.eigen)
+
+        result = stormpy.model_checking(instantiated_model, self.pctlformula[0],environment=env)
         self._instantiated_model_checking_time += time.time() - start
         self._samples_checked += 1
         return result

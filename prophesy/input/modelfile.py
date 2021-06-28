@@ -79,7 +79,8 @@ class DrnFile(ModelInput):
             for line in file:
                 if next_line_has_parameters:
                     parameter_names = line.split()
-                    logger.debug("Parameter names: %s", str(parameter_names))
+                    print("Number of parameters:",len(parameter_names))
+                    #logger.debug("Parameter names: %s", str(parameter_names))
                     for par_name in parameter_names:
                         # TODO change this in order to support variables for rewards.
                         bound = interval.Interval(Rational(0), interval.BoundType.open, Rational(1),
