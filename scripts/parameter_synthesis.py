@@ -2,16 +2,17 @@
 import logging
 import time
 
-import click
+
 import prophesy.adapter.pycarl as pc
+import click
 import prophesy.config
 import random
 import numpy
+import sys
 from prophesy.data.constant import parse_constants_string
 from prophesy.data.hyperrectangle import HyperRectangle
 from prophesy.data.samples import InstantiationResultDict
 from prophesy.data.property import OperatorDirection, OperatorType
-from prophesy.data.parameter import Monotonicity
 from prophesy.input.modelfile import open_model_file
 from prophesy.input.pctlfile import PctlFile
 from prophesy.input.problem_description import ProblemDescription
@@ -25,7 +26,6 @@ from prophesy.optimisation.pla_based_search import PlaSearchOptimisation
 from prophesy.regions.region_checker import RegionCheckResult
 from prophesy.regions.region_etrchecker import EtrRegionChecker
 from prophesy.regions.region_plachecker import PlaRegionChecker
-from prophesy.regions.region_monochecker import MonoRegionChecker
 from prophesy.regions.region_quads import HyperRectangleRegions
 from prophesy.regions.region_solutionfunctionchecker import SolutionFunctionRegionChecker
 from prophesy.regions.welldefinedness import check_welldefinedness, is_welldefined
@@ -35,6 +35,10 @@ from prophesy.smt.YicesCli_solver import YicesCLISolver
 from prophesy.smt.Z3cli_solver import Z3CliSolver
 from prophesy.smt.isat import IsatSolver
 from prophesy.optimisation.qcqp import QcqpModelRepair
+from prophesy.optimisation.qcqp_noncvx import QcqpCvxModelRepair
+from prophesy.optimisation.affine import AffineModelRepair
+from prophesy.optimisation.affine_trust_region import AffineModelRepairTrustRegion
+from prophesy.optimisation.qcqp_noncvx import QcqpCvxModelRepair
 from prophesy.modelcheckers.pmc import BisimulationType
 
 def select_mc(f):
@@ -75,16 +79,14 @@ def ensure_model_set(mc, model, constants, property):
 @click.option("--log-smt-calls")
 @click.option("--config")
 @click.option("--logfile", default="prophesy.log")
-@click.option('--nolog', is_flag=True, help="Suppres logging")
-@click.option('--verbose', '-v', is_flag=True, help='Print more output')
 @pass_state
-def parameter_synthesis(state, log_smt_calls, config, logfile, nolog, verbose):
-    set_random_seed(0)
-    if not nolog:
-        logging.basicConfig(filename=logfile, format='%(levelname)s - %(name)s:%(message)s', level=logging.DEBUG if verbose else logging.INFO)
-        ch = logging.StreamHandler()
-        ch.setLevel(logging.DEBUG if verbose else logging.INFO)
-        logging.getLogger().addHandler(ch)
+def parameter_synthesis(state, log_smt_calls, config, logfile):
+    seedval=numpy.random.seed()
+    set_random_seed(seedval)
+    logging.basicConfig(filename=logfile, format='%(levelname)s - %(name)s:%(message)s', level=logging.DEBUG)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    logging.getLogger().addHandler(ch)
     logging.debug("Loading configuration")
     state.obj = ConfigState()
     state.overall_start_time = time.time()
@@ -99,6 +101,10 @@ def parameter_synthesis(state, log_smt_calls, config, logfile, nolog, verbose):
     state.mc = make_modelchecker(state.mc)
     state.solver = make_solver(state.solver)
     state.log_smt_calls = log_smt_calls
+    for i in range(len(sys.argv)):
+        logging.debug(sys.argv[i])
+        #logging.debug("\n")
+
     return state
 
 
@@ -107,13 +113,11 @@ def parameter_synthesis(state, log_smt_calls, config, logfile, nolog, verbose):
 @click.argument('property-file')
 @click.option('--constants')
 @click.option('--pctl-index', default=0)
-@click.option('--transform-continuous', is_flag=True)
 @pass_state
-def load_problem(state, model_file, property_file, constants, pctl_index, transform_continuous):
+def load_problem(state, model_file, property_file, constants, pctl_index):
     constants = parse_constants_string(constants)
     click.echo(constants)
     state.problem_description.model = open_model_file(model_file)
-    state.problem_description.model.do_transform = transform_continuous
     pctl_file = PctlFile(property_file)
     state.problem_description.property = pctl_file.get(pctl_index)
     state.problem_description.constants = constants
@@ -150,6 +154,7 @@ def set_bisimulation(state, bisimulation_type):
         btype = BisimulationType.weak
     if bisimulation_type == "none":
         btype = BisimulationType.none
+    #btype = BisimulationType.none
     state.mc.set_bisimulation_type(btype)
     return state
 
@@ -165,26 +170,6 @@ def load_solution_function(state, solution_file):
     return state
 
 @parameter_synthesis.command()
-@click.option('--region-string', help="set the region. If no region is set, the open (0,1) cube is used.")
-@click.option('--epsilon', type=pc.Rational)
-@pass_state
-def set_parameter_space(state, region_string, epsilon):
-    if state.problem_description.parameters is None:
-        raise RuntimeError("Parameters should be fixed before setting the parameter space.")
-    if region_string:
-        logging.info("Setting parameter space from region string")
-        state.problem_description.set_parameter_space_from_region_string(region_string)
-        if epsilon:
-            raise RuntimeError("Cannot use epsilon option when region string is explicitly set.")
-    elif epsilon:
-        logging.info("Setting default parameter space (with epsilon={})".format(epsilon))
-        state.problem_description.set_closed_epsilon_parameter_space(epsilon)
-    else:
-        logging.info("Setting default parameter space")
-        state.problem_description.set_open01_parameter_space()
-    return state
-
-@parameter_synthesis.command()
 @click.option('--export')
 @pass_state
 def compute_solution_function(state, export):
@@ -192,31 +177,27 @@ def compute_solution_function(state, export):
     state.mc.load_model(state.problem_description.model, state.problem_description.constants)
     state.mc.set_pctl_formula(state.problem_description.property)
     result = state.mc.get_rational_function()
-    #state.problem_description.parameters.update_variables(result.ratfunc.gather_variables())
-
-    # Mapping for parameters from solution function
-    def get_matching_model_parameter(model_parameters, variable_name):
-        """Return matching parameter or None."""
-        return next((v for v in model_parameters if v.name == variable_name), None)
-
-    parameter_mapping = {}
-    model_parameters = state.problem_description.parameters
-    for sf_param in result.ratfunc.gather_variables():
-        model_param = get_matching_model_parameter(model_parameters, sf_param.name)
-        parameter_mapping[sf_param] = pc.Polynomial(model_param)
-
-    for parameter in result.ratfunc.gather_variables():
-        assert parameter in parameter_mapping, repr(parameter) + " not in  " + str(parameter_mapping)
-
-    # Convert variables to prophesy variables according to generated mapping
-    # Note that the substitution looses the factorization
-    state.problem_description.solution_function = pc.substitute_variables_ratfunc(result.ratfunc, parameter_mapping)
+    state.problem_description.solution_function = result.ratfunc
+    state.problem_description.parameters.update_variables(result.ratfunc.gather_variables())
 
     state.problem_description.welldefined_constraints = result.welldefined_constraints
     state.problem_description.graph_preserving_constraints = result.graph_preservation_constraints
     if export:
         write_pstorm_result(export, result)
     return state
+    #
+    # problem_parameters = [p for p in model_file.parameters if p not in constants]
+    # if problem_parameters != result.parameters:
+    #     if len(problem_parameters) != len(result.parameters):
+    #         raise ValueError(
+    #             "Parameters in model '{}' and in result '{}' do not coincide.".format(model_file.parameters,
+    #                                                                                   result.parameters))
+    #     for p in problem_parameters:
+    #         if p not in result.parameters:
+    #             raise ValueError(
+    #                 "Parameters in model '{}' and in result '{}' do not coincide.".format(prism_file.parameters,
+    #                                                                                       result.parameters))
+    #     result.parameters = model_file.parameters
 
 
 @parameter_synthesis.command()
@@ -225,7 +206,7 @@ def compute_solution_function(state, export):
 @click.option('--plot')
 @click.option('--samplingnr', type=int, help='number of samples per dimension', default=4)
 @click.option('--iterations', type=int, help='number of sampling refinement iterations', default=0)
-@click.option('--stats', help="file to write sample stats to")
+@click.option('--stats', default="stats.txt", help="file to write sample stats to")
 @pass_state
 def sample(state, export, method, plot, samplingnr, iterations, stats):
     logging.info("Compute samples..")
@@ -247,22 +228,15 @@ def sample(state, export, method, plot, samplingnr, iterations, stats):
 
     logging.debug("Performing uniform sampling ..")
     uniform_sampling_time = time.time()
-    initial_samples = uniform_samples(sampling_interface, state.problem_description.parameters, state.problem_description.parameter_space, samplingnr)
+    initial_samples = uniform_samples(sampling_interface, state.problem_description.parameters, samplingnr)
     #logging.info("Performing uniform sampling: {} samples".format(len(initial_samples)))
     uniform_sampling_time = time.time() - uniform_sampling_time
     nr_initial_samples = len(initial_samples)
-
-    if state.problem_description.threshold is None:
-        logging.warning("Threshold was not provided. No refinement sampling possible.")
-        if export:
-            write_samples_file(state.problem_description.parameters, initial_samples, export)
-        return state
-
     nr_initial_samples_safe = len(initial_samples.split(state.problem_description.threshold)[0])
 
     logging.debug("Performing refined sampling ..")
     refine_sampling_time = time.time()
-    refined_samples = refine_samples(sampling_interface, state.problem_description.parameters, state.problem_description.parameter_space, initial_samples, iterations,
+    refined_samples = refine_samples(sampling_interface, state.problem_description.parameters, initial_samples, iterations,
                                      state.problem_description.threshold)
     refined_sampling_time = time.time() - refine_sampling_time
 
@@ -290,7 +264,6 @@ def sample(state, export, method, plot, samplingnr, iterations, stats):
                 open_file(plot_path)
         else:
             logging.info("Cannot plot, as dimension is too high!")
-    state.problem_description.samples = refined_samples
     return state
 
 
@@ -304,33 +277,6 @@ def load_samples(state, samples_file):
         # TODO
         raise RuntimeError("Sampling and problem parameters are not equal")
     state.problem_description.samples = samples
-    return state
-
-@parameter_synthesis.command()
-@click.argument('mono-file')
-@pass_state
-def load_monotonicity(state, mono_file):
-    state.problem_description.monotonicity = dict()
-    with open(mono_file, 'r') as f:
-        for line in f:
-            if line.startswith("//"):
-                continue
-            kv = line.strip().split()
-            if len(kv) != 2:
-                raise RuntimeError("Expected key-value pairs")
-            logging.debug("Found Parameter Name: {}".format(kv[0]))
-            if kv[1] == "+":
-                mono = Monotonicity.POSITIVE
-            elif kv[1] == "-":
-                mono = Monotonicity.NEGATIVE
-            elif kv[1] == "?":
-                mono = Monotonicity.UNKNOWN
-            elif kv[1] == "x":
-                mono = Monotonicity.NEITHER
-            else:
-                raise RuntimeError("Expected either of the following: {+,-,?,x} but got {}".format(kv[1]))
-            state.problem_description.monotonicity[kv[0]] = mono
-
     return state
 
 @parameter_synthesis.command()
@@ -380,8 +326,6 @@ def find_feasible_instantiation(state, stats, epsilon, qcqp_incremental, qcqp_mc
         # TODO it would be better to modify the model accordingly, but that might be hard to realise.
         # The variable bounds generated here are not necessarily induced by graph-epsilons.
         # However, for benchmarks we use, it is the same.
-
-    #TODO add option to set region (maybe via a command)
     region = HyperRectangle(*state.problem_description.parameters.get_parameter_bounds())
     encoding_time = 0.0
     solver_time = 0.0
@@ -411,12 +355,11 @@ def find_feasible_instantiation(state, stats, epsilon, qcqp_incremental, qcqp_mc
         if result == RegionCheckResult.Satisfied:
             print("No such point")
         elif result == RegionCheckResult.CounterExample:
-            print("Point found: {}: {} (approx. {})".format(str(data.instantiation), str(data.result), float(data.result)))
+            #print("Point found: {}: {} (approx. {})".format(str(data.instantiation), str(data.result), float(data.result)))
             result = data
             result_found = True
         else:
             raise RuntimeError("Region checker returns with {}".format(result))
-
 
     if method in ["qcqp"]:
         if qcqp_mc is None:
@@ -430,6 +373,99 @@ def find_feasible_instantiation(state, stats, epsilon, qcqp_incremental, qcqp_mc
                                       state.mc.get_parameter_constraints()[1]))
 
         checker = QcqpModelRepair(state.mc)
+        qcqp_incremental=True
+        checker.initialize(state.problem_description, epsilon, incremental=qcqp_incremental, use_mc=qcqp_mc, handle_violation=qcqp_handle_violation, all_welldefined=is_certainly_welldefined, store_quadratic=qcqp_store_quadratic, verbose=verbose)
+        lower_state_bounds = None
+        upper_state_bounds = None
+        if precompute_state_bounds:
+            upper_state_bounds, _ = state.mc.bound_value_in_hyperrectangle(state.problem_description.parameters, region, True, all_states=True)
+            lower_state_bounds, _ = state.mc.bound_value_in_hyperrectangle(state.problem_description.parameters, region, False, all_states=True)
+
+        result = checker.run(dir, upper_state_var_bounds=upper_state_bounds, lower_state_var_bounds=lower_state_bounds)
+
+#        print(dir(checker))
+        encoding_time = checker.encoding_timer
+        solver_time = checker.solver_time
+        iterations = checker.iterations
+        adding_cons_time=checker.auxtimer2
+        print(adding_cons_time)
+        print("Final result: {} (approx. {})".format( str(result.result), float(result.result)))
+
+        #print("Point found: {}: {} (approx. {})".format(str(result.instantiation), str(result.result), float(result.result)))
+        result_found = True
+    elif method in ["affine"]:
+        if qcqp_mc is None:
+            qcqp_mc = "no"
+        if qcqp_handle_violation is None:
+            qcqp_handle_violation = "minimisation"
+        is_certainly_welldefined = False
+        if precheck_welldefinedness:
+            is_certainly_welldefined = is_welldefined(
+                check_welldefinedness(state.solver, state.problem_description.parameters, region,
+                                      state.mc.get_parameter_constraints()[1]))
+
+        checker = AffineModelRepair(state.mc)
+        qcqp_incremental=True
+        checker.initialize(state.problem_description, epsilon, incremental=qcqp_incremental, use_mc=qcqp_mc, handle_violation=qcqp_handle_violation, all_welldefined=is_certainly_welldefined, store_quadratic=qcqp_store_quadratic, verbose=verbose)
+        lower_state_bounds = None
+        upper_state_bounds = None
+        if precompute_state_bounds:
+            upper_state_bounds, _ = state.mc.bound_value_in_hyperrectangle(state.problem_description.parameters, region, True, all_states=True)
+            lower_state_bounds, _ = state.mc.bound_value_in_hyperrectangle(state.problem_description.parameters, region, False, all_states=True)
+
+        result = checker.run(dir, upper_state_var_bounds=upper_state_bounds, lower_state_var_bounds=lower_state_bounds)
+        print((checker))
+
+        encoding_time = checker.encoding_timer
+        solver_time = checker.solver_time
+        iterations = checker.iterations
+        adding_cons_time=checker.auxtimer2
+        print(adding_cons_time)
+        print("Final result: {} (approx. {})".format( str(result.result), float(result.result)))
+        result_found = True
+    elif method in ["affine_scp"]:
+        if qcqp_mc is None:
+            qcqp_mc = "no"
+        if qcqp_handle_violation is None:
+            qcqp_handle_violation = "minimisation"
+        is_certainly_welldefined = False
+        if precheck_welldefinedness:
+            is_certainly_welldefined = is_welldefined(
+                check_welldefinedness(state.solver, state.problem_description.parameters, region,
+                                      state.mc.get_parameter_constraints()[1]))
+
+        checker = AffineModelRepairTrustRegion(state.mc)
+        qcqp_incremental=True
+        checker.initialize(state.problem_description, epsilon, incremental=qcqp_incremental, use_mc=qcqp_mc, handle_violation=qcqp_handle_violation, all_welldefined=is_certainly_welldefined, store_quadratic=qcqp_store_quadratic, verbose=verbose)
+        lower_state_bounds = None
+        upper_state_bounds = None
+        if precompute_state_bounds:
+            upper_state_bounds, _ = state.mc.bound_value_in_hyperrectangle(state.problem_description.parameters, region, True, all_states=True)
+            lower_state_bounds, _ = state.mc.bound_value_in_hyperrectangle(state.problem_description.parameters, region, False, all_states=True)
+
+        result = checker.run(dir, upper_state_var_bounds=upper_state_bounds, lower_state_var_bounds=lower_state_bounds)
+        print((checker))
+
+        encoding_time = checker.encoding_timer
+        solver_time = checker.solver_time
+        iterations = checker.iterations
+        adding_cons_time=checker.auxtimer2
+        print(adding_cons_time)
+        print("Final result: {} (approx. {})".format( str(result.result), float(result.result)))
+        result_found = True
+    elif method in ["noncvx"]:
+        if qcqp_mc is None:
+            qcqp_mc = "no"
+        if qcqp_handle_violation is None:
+            qcqp_handle_violation = "minimisation"
+        is_certainly_welldefined = False
+        if precheck_welldefinedness:
+            is_certainly_welldefined = is_welldefined(
+                check_welldefinedness(state.solver, state.problem_description.parameters, region,
+                                      state.mc.get_parameter_constraints()[1]))
+
+        checker = QcqpCvxModelRepair(state.mc)
+        qcqp_incremental=True
         checker.initialize(state.problem_description, epsilon, incremental=qcqp_incremental, use_mc=qcqp_mc, handle_violation=qcqp_handle_violation, all_welldefined=is_certainly_welldefined, store_quadratic=qcqp_store_quadratic, verbose=verbose)
         lower_state_bounds = None
         upper_state_bounds = None
@@ -443,8 +479,18 @@ def find_feasible_instantiation(state, stats, epsilon, qcqp_incremental, qcqp_mc
         encoding_time = checker.encoding_timer
         solver_time = checker.solver_time
         iterations = checker.iterations
-        print("Point found: {}: {} (approx. {})".format(str(result.instantiation), str(result.result), float(result.result)))
-        result_found = True
+        if result is not None:
+            print("Final result: {} (approx. {})".format( str(result.result), float(result.result)))
+            result_found = True
+        else:
+            procedure_time = time.time() - start_time
+            total_time = time.time() - state.overall_start_time
+            if stats:
+                with open(stats, 'w') as file:
+                    file.write("total-time={}\n".format(total_time))
+                    file.write("procedure-time={}\n".format(procedure_time))
+                    file.write("encoding-time={}\n".format(encoding_time))
+            return state
     elif method in ["pso"]:
         start_wd_check = time.time()
         is_wd = is_welldefined(check_welldefinedness(state.solver, state.problem_description.parameters, region, state.mc.get_parameter_constraints()[1]))
@@ -456,18 +502,25 @@ def find_feasible_instantiation(state, stats, epsilon, qcqp_incremental, qcqp_mc
         optimizer.set_termination_threshold(state.problem_description.threshold)
         result = optimizer.search()
         iterations = optimizer.iterations
-        print("Point found: {}: {} (approx. {})".format(str(result.instantiation), str(result.result), float(result.result)))
+        #print("Point found: {}: {} (approx. {})".format(str(result.instantiation), str(result.result), float(result.result)))
         result_found = True
 
     if result_found:
-        if dir == "below" and result.result > state.problem_description.threshold:
+        if dir == "below" and float(result.result) > float(state.problem_description.threshold):
             raise ValueError("Result does not match threshold")
-        if dir == "above" and result.result < state.problem_description.threshold:
+        if dir == "above" and float(result.result) < float(state.problem_description.threshold):
             raise ValueError("Result does not match threshold")
     procedure_time = time.time() - start_time
     total_time = time.time() - state.overall_start_time
 
     print("This procedure took {}s (from start: {}s)".format(procedure_time, total_time))
+    print("Ratio of solver time over procedure time {}".format(solver_time/procedure_time))
+    print("Ratio of model building time time over procedure time {}".format(state.mc.model_building_time/procedure_time))
+    print("Ratio of mc time time over procedure time {}".format(state.mc.instantiated_model_checking_time/procedure_time))
+    print("Ratio of encoding time over procedure time {}".format(encoding_time/procedure_time))
+    if method not in ["pso"] and method not in ["noncvx"]:
+        print("Ratio of adding cons time over procedure time {}".format(adding_cons_time/procedure_time))
+
     if stats:
         with open(stats, 'w') as file:
             file.write("total-time={}\n".format(total_time))
@@ -527,6 +580,29 @@ def prove_bound(state, epsilon, verification_method, direction):
     else:
         raise ValueError("Could not prove bound")
     return state
+#
+# @parameter_synthesis.command()
+# @click.argument("verification-method")
+# @pass_state
+# def find_and_prove_bound(state, verification_method):
+#     if verification_method == "pla":
+#         raise RuntimeError("Currently, PLA can only be used to bound. We need to extend PlaSearchOptimisation")
+#     elif verification_method == "etr":
+#         optimiser = BinarySearchOptimisation(SolutionFunctionRegionChecker(state.solver), state.problem_description)
+#     elif verification_method == "sfsmt":
+#         optimiser = BinarySearchOptimisation(EtrRegionChecker(state.solver, state.mc), state.problem_description)
+#
+#
+#     if state.problem_description.property.operator_direction == OperatorDirection.max:
+#         if state.problem_description.property.operator == OperatorType.reward:
+#             bound = pc.inf
+#         else:
+#             bound = pc.Rational(1)
+#     else:
+#         bound = pc.Rational(0)
+#     optimiser.search(requested_gap=cmdargs.gap, max_iterations=cmdargs.iterations, dir=optimal_dir, realised=score,
+#                      bound=bound)
+#     return state
 
 
 @parameter_synthesis.command()
@@ -534,27 +610,29 @@ def prove_bound(state, epsilon, verification_method, direction):
 @click.argument("region-method")
 @click.option("--iterations", default=10000000)
 @click.option("--area", type=pc.Rational, default=1)
+@click.option("--epsilon", type=pc.Rational)
 @click.option("--stats", help="File to write synthesis stats to")
 @click.option("--plot", help="Should a plot be generated", is_flag=True)
 @click.option("--allow-homogeneity-checks", is_flag=True)
 @click.option("--display-model", is_flag=True)
-@click.option("--export", type=str, help="File to write regions to")
 @pass_state
-def parameter_space_partitioning(state, verification_method, region_method, iterations, area, stats, plot, allow_homogeneity_checks, display_model, export):
+def parameter_space_partitioning(state, verification_method, region_method, iterations, area, epsilon, stats, plot, allow_homogeneity_checks, display_model):
     if state.problem_description.samples is None:
         state.problem_description.samples = InstantiationResultDict(parameters=state.problem_description.parameters)
 
-    if verification_method in ["etr", "pla", "mono"] or state.problem_description.welldefined_constraints is None:
+    if verification_method in ["etr", "pla"] or state.problem_description.welldefined_constraints is None:
         # TODO dont do this always (that is, if it has been loaded before..)
-        if not state.mc.has_built_model():
-            logging.debug("Load model to model checker...")
-            state.mc.load_model(state.problem_description.model, state.problem_description.constants)
-            state.mc.set_pctl_formula(state.problem_description.property)
+        state.mc.load_model(state.problem_description.model, state.problem_description.constants)
+        state.mc.set_pctl_formula(state.problem_description.property)
 
+    #TODO only do this when gp is set
+    state.problem_description.parameters.make_intervals_open()
 
-    if state.problem_description.parameter_space is None:
-        logging.info("Set default parameter space")
-        state.problem_description.set_open01_parameter_space()
+    if epsilon:
+        # First, create the open interval
+        state.problem_description.parameters.make_intervals_open()
+        state.problem_description.parameters.make_intervals_closed(epsilon)
+
 
     if state.problem_description.welldefined_constraints is None:
         if state.mc is None:
@@ -566,17 +644,13 @@ def parameter_space_partitioning(state, verification_method, region_method, iter
         state.problem_description.welldefined_constraints = wd
         state.problem_description.graph_preserving_constraints = gp
 
-    sampler = None
+
     if verification_method == "etr":
         if state.solver is None:
             raise RuntimeError("For ETR an SMT solver is required.")
         if state.mc.name() != "stormpy":
             raise RuntimeError("For ETR stormpy is required.")
         checker = EtrRegionChecker(state.solver, state.mc)
-    elif verification_method == "mono":
-        if state.mc is None:
-            raise RuntimeError("For Mono, a model checker is required")
-        checker = MonoRegionChecker(state.mc)
     elif verification_method == "sfsmt":
         if state.problem_description.solution_function is None:
             raise RuntimeError("For SFSMT the solution function is required.")
@@ -587,7 +661,6 @@ def parameter_space_partitioning(state, verification_method, region_method, iter
         if state.mc is None:
             raise RuntimeError("For PLA, a model checker is required.")
         checker = PlaRegionChecker(state.mc)
-        sampler = state.mc
     else:
         raise RuntimeError("No method for region checking selected.")
 
@@ -600,22 +673,14 @@ def parameter_space_partitioning(state, verification_method, region_method, iter
 
     generator = HyperRectangleRegions(state.problem_description.samples,
                                       state.problem_description.parameters,
-                                      state.problem_description.parameter_space,
                                       state.problem_description.threshold,
                                       checker,
                                       state.problem_description.welldefined_constraints,
                                       state.problem_description.graph_preserving_constraints,
-                                      split_uniformly=region_method == "quads", generate_plots=plot,
-                                      allow_homogeneity=allow_homogeneity_checks, sampler=sampler)
-
+                                      split_uniformly=region_method == "quads", generate_plots=plot, allow_homogeneity=allow_homogeneity_checks)
 
     generator.generate_constraints(max_iter=iterations, max_area=area, plot_every_n=100000,
                                        plot_candidates=False, export_statistics=stats)
-
-    if export:
-        generator.export_results(export)
-    # TODO consider using a logger for results
-    print("Usage stats: {}".format(state.mc.usage_stats()))
     return state
 
 def make_modelchecker(mc):
@@ -665,9 +730,8 @@ def make_solver(solver):
     return tool
 
 if __name__ == "__main__":
-    state = parameter_synthesis.main(standalone_mode=False)
-    if state is not None and type(state) is not int:
-        state = state[0]
+    state = parameter_synthesis.main(standalone_mode=False)[0]
+    if state is not None:
         state.solver.stop()
         if state.log_smt_calls:
             state.solver.to_file(state.log_smt_calls)
