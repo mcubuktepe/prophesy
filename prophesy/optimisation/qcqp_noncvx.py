@@ -70,7 +70,6 @@ class QcqpSolver():
         self._pexpr = None
         self._mu = None
         self._constants_floats = dict()
-        self.total_timer=0.0
         self._auxtimer1 = 0.0
         self._auxtimer2 = 0.0
         self._auxtimer3 = 0.0
@@ -82,8 +81,6 @@ class QcqpSolver():
         self._property_type = None
         self._lower_state_bounds = None
         self._upper_state_bounds = None
-        self._iterval=[]
-
         if not modules.is_module_available("gurobipy"):
             raise RuntimeError("Using QCQP requires gurobi-python.")
 
@@ -155,13 +152,18 @@ class QcqpSolver():
         numstate = model.nr_states
 
         self._encoding = Model("qcp")
-        self._encoding.setParam('OutputFlag', 0)
+        self._encoding.setParam('OutputFlag', 1)
+        #self._encoding.setParam('Threads', 1)
+        #self._encoding.setParam('NumericFocus', 3)
         self._encoding.setParam(GRB.Param.BarHomogeneous, 1.0)
-        # self._encoding.setParam('NumericFocus', 3)
-        # self._encoding.Params.Presolve = 2
-        # self._encoding.Params.FeasibilityTol = 1e-4
-        # self._encoding.Params.OptimalityTol = 1e-8
-        # self._encoding.Params.BarConvTol = 1e-8
+        #self._encoding.Params.Presolve = 2
+        # m.Params.Aggregate = 0
+        #self._encoding.Params.ScaleFlag = 2
+        self._encoding.Params.Method = 2
+        self._encoding.Params.Crossover = 0
+        self._encoding.Params.CrossoverBasis = 1
+        self._encoding.Params.NonConvex = 2
+        self._encoding.Params.TimeLimit = 1200
 
         # Initializing gurobi variables for parameters,lb=lowerbound, ub=upperbound
         if lower_state_bounds is None and upper_state_bounds is None:
@@ -172,7 +174,6 @@ class QcqpSolver():
         else:
             assert lower_state_bounds is not None
             assert upper_state_bounds is not None
-            #print(upper_state_bounds)
             self._pVars = [self._encoding.addVar(lb=lower_state_bounds.at(state) if lower_state_bounds.at(state) < math.inf else 0.0, ub=upper_state_bounds.at(state)) for state in range(numstate)]
 
         self._tau = [self._encoding.addVar(lb=0) for _ in range(numstate)]
@@ -248,7 +249,7 @@ class QcqpSolver():
                                 cons1 = cons1 + coeff * self._paramVars[param_id] / float(den)
                     # If the transition has parameters, constrain each transition to between 0 and 1
                     if not isinstance(cons1, float):
-                        #print(cons1)
+                        # print(cons1)
                         self._encoding.addConstr(cons1 >= 0 + options.graph_epsilon)
                         self._encoding.addConstr(cons1 <= 1 - options.graph_epsilon)
 
@@ -303,19 +304,19 @@ class QcqpSolver():
                     if not options.store_quadratic or not options.incremental:
                         l_part_cons += l_cons
 
-                # add a penalty term to the constraints
+                # If the constraint is quadratic, add a penalty term to the constraints, otherwise dont add the term
                 if not isinstance(q_part_cons, int):
                     if dir == "above":
-                        self._encoding.addQConstr(self._pVars[state] <= l_part_cons + q_part_cons + self._tau[state])
+                        self._encoding.addQConstr(self._pVars[state] <= l_part_cons + q_part_cons )
                     else:
-                        self._encoding.addQConstr(self._pVars[state] >= l_part_cons + q_part_cons - self._tau[state])
+                        self._encoding.addQConstr(self._pVars[state] >= l_part_cons + q_part_cons)
                        # print(q_part_cons)
 
                 elif not only_quadratic:
                     if dir == "above":
-                        self._encoding.addConstr(self._pVars[state] <= l_part_cons+ self._tau[state])
+                        self._encoding.addConstr(self._pVars[state] <= l_part_cons)
                     else:
-                        self._encoding.addConstr(self._pVars[state] >= l_part_cons- self._tau[state])
+                        self._encoding.addConstr(self._pVars[state] >= l_part_cons)
                 action += 1
 
 
@@ -343,14 +344,14 @@ class QcqpSolver():
                 if not isinstance(q_part_cons, int):
                     quadratic_entries.append((q_entries, l_part_cons))
                     if dir == "above":
-                        self._encoding.addQConstr(self._pVars[state] <= l_part_cons + q_part_cons + self._tau[state])
+                        self._encoding.addQConstr(self._pVars[state] <= l_part_cons + q_part_cons )
                     else:
-                        self._encoding.addQConstr(self._pVars[state] >= l_part_cons + q_part_cons - self._tau[state])
+                        self._encoding.addQConstr(self._pVars[state] >= l_part_cons + q_part_cons )
                 else:
                     if dir == "above":
-                        self._encoding.addConstr(self._pVars[state] <= l_part_cons+ self._tau[state])
+                        self._encoding.addConstr(self._pVars[state] <= l_part_cons)
                     else:
-                        self._encoding.addConstr(self._pVars[state] >= l_part_cons- self._tau[state])
+                        self._encoding.addConstr(self._pVars[state] >= l_part_cons)
                 action += 1
             if len(quadratic_entries) > 0:
                 quadratic_states_and_transitions.append((state, quadratic_entries))
@@ -417,27 +418,29 @@ class QcqpSolver():
                     check_t = time.time()
 
                     negative_case = (dir == "above" and coeff > 0) or (dir == "below" and coeff < 0)
-                    if dir == "above":
-                        if coeff > 0:
-                            q_cons += -coeff_times_denom * (0.5 * (pinit_succ) ** 2 -pinit_succ * statevar + pexpr)
-                            c = LinExpr([1.0, -1.0], [statevar, paramvar])
-                            q_cons += -coeff_times_denom * 0.5 * c * c
-                        else:
-                            q_cons += LinExpr(coeff_times_denom) * (0.5 * (pinit_succ) ** 2 - pinit_succ * statevar + pexpr)
-                            c = LinExpr([1.0, 1.0], [statevar, paramvar])
-                            q_cons += coeff_times_denom * 0.5 * c * c
-
-                    # The bilinear terms are split into convex+concave terms, then the concave term is underapproximated by a affine term
-                    # First term in the addition is the affine term, second term is the convex term
-                    else:
-                        if negative_case:
-                            q_cons += -coeff_times_denom * (0.5 * (pinit_succ) ** 2 -pinit_succ * statevar + pexpr)
-                            c = LinExpr([1.0, -1.0], [statevar, paramvar])
-                            q_cons += -coeff_times_denom * 0.5 * c * c
-                        else:
-                            q_cons += LinExpr(coeff_times_denom) * (0.5 * (pinit_succ) ** 2 - pinit_succ * statevar + pexpr)
-                            c = LinExpr([1.0, 1.0], [statevar, paramvar])
-                            q_cons += coeff_times_denom * 0.5 * c * c
+                    #if True:
+                    q_cons+=coeff_times_denom*statevar * paramvar
+                    # if dir == "above":
+                    #     if coeff > 0:
+                    #         q_cons += -coeff_times_denom * (0.5 * (pinit_succ) ** 2 -pinit_succ * statevar + pexpr)
+                    #         c = LinExpr([1.0, -1.0], [statevar, paramvar])
+                    #         q_cons += -coeff_times_denom * 0.5 * c * c
+                    #     else:
+                    #         q_cons += LinExpr(coeff_times_denom) * (0.5 * (pinit_succ) ** 2 - pinit_succ * statevar + pexpr)
+                    #         c = LinExpr([1.0, 1.0], [statevar, paramvar])
+                    #         q_cons += coeff_times_denom * 0.5 * c * c
+                    #
+                    # # The bilinear terms are split into convex+concave terms, then the concave term is underapproximated by a affine term
+                    # # First term in the addition is the affine term, second term is the convex term
+                    # else:
+                    #     if negative_case:
+                    #         q_cons += -coeff_times_denom * (0.5 * (pinit_succ) ** 2 -pinit_succ * statevar + pexpr)
+                    #         c = LinExpr([1.0, -1.0], [statevar, paramvar])
+                    #         q_cons += -coeff_times_denom * 0.5 * c * c
+                    #     else:
+                    #         q_cons += LinExpr(coeff_times_denom) * (0.5 * (pinit_succ) ** 2 - pinit_succ * statevar + pexpr)
+                    #         c = LinExpr([1.0, 1.0], [statevar, paramvar])
+                    #         q_cons += coeff_times_denom * 0.5 * c * c
                     self._auxtimer1 += time.time() - check_t
 
         self._auxtimer2 += time.time() - proc_start
@@ -458,16 +461,18 @@ class QcqpSolver():
         if options.minimise_violation:
             for state in range(numstate):
                 # This minimizes sum of violation,
-                objective += self._tau[state]
+                pass
+                #objective += self._tau[state]/self._mu
         else:
-            objective += self._tt
+            pass
+            #objective += self._tt
         #Maximize the probability of initial state
         if dir == "below":
 
-            objective += self._pVars[initstate]/self._mu
+            objective += self._pVars[initstate]
         else:
-           objective -= self._pVars[initstate]/self._mu
-        self._encoding.setObjective(objective, GRB.MINIMIZE)
+           objective -= self._pVars[initstate]
+        self._encoding.setObjective(0, GRB.MINIMIZE)
 
     def _violation_constraints(self, model, options):
         """
@@ -503,30 +508,12 @@ class QcqpSolver():
             elif dir == "above" and float(eval_res[sample]) > threshold:
                 return QcqpResult(self._pVars[initstate].x, param_values), None
         elif options.intermediate_mc:
-
             param_values = dict([[id, self._clamp_to_bounds(param_var.x, id)] for id, param_var in self._paramVars.items()])
             mc_results = self._mc_check(param_values)
-
-            self._iterval.append(mc_results.at(initstate))
-
-            if time.time()-self._global_timer>self._timeout:
-                print("Time out has elapsed after {} seconds:".format(self._timeout))
-                return QcqpResult(self._pVars[initstate].x, param_values), None
-            #print(self._iterval)
-
             print("Init prob: ",mc_results.at(initstate))
             if dir == "below" and mc_results.at(initstate) < threshold:
-                ii=1
-                for item in self._iterval:
-                    #print(ii, item)
-                    ii=ii+1
                 return QcqpResult(self._pVars[initstate].x, param_values), None
-
             elif dir == "above" and mc_results.at(initstate) > threshold:
-                ii=1
-                for item in self._iterval:
-                    #print(ii, item)
-                    ii=ii+1
                 return QcqpResult(self._pVars[initstate].x, param_values), None
             else:
                 return None, mc_results
@@ -539,7 +526,7 @@ class QcqpSolver():
                 self._pinit[state] = max(0, mc_result.at(state))
         else:
             for state in range(len(self._pinit)):
-                if abs(self._pVars[state].x) > 0e-8:
+                if abs(self._pVars[state].x) > 1e-8:
                     self._pinit[state] = self._pVars[state].x
                 else:
                     self._pinit[state] = 0
@@ -575,7 +562,6 @@ class QcqpSolver():
         """
         assert direction in ["above", "below"]
         assert property_type in ["probability", "reward"]
-        self._global_timer=time.time()
         self._prob0E = prob0E
         self._prob1A = prob1A
         self._parameters = parameters
@@ -583,7 +569,6 @@ class QcqpSolver():
         self._upper_state_bounds = upper_state_bounds
         self._compute_states_and_transitions(model)
         self._property_type = property_type
-        self._timeout=1200
         if property_type == "reward":
             self._reward_model = self._get_reward_model(model, reward_name)
 
@@ -620,8 +605,10 @@ class QcqpSolver():
 
             if options.threshold_constraint:
                 if dir == "above":
-                    self._encoding.addConstr(self._pVars[initstate]>= threshold)
+                    pass
+                    self._encoding.addConstr(self._pVars[initstate] >= threshold)
                 else:
+                    pass
                     self._encoding.addConstr(self._pVars[initstate] <= threshold)
             self._set_objective(model, initstate, dir, options)
             self._violation_constraints(model, options)
@@ -640,8 +627,6 @@ class QcqpSolver():
             maxx = 0
             for state in range(numstate):
                 val = self._tau[state].x
-                if val>1e-8:
-                    print(self._tau[state].x)
                 if val > maxx:
                     maxx = val
 
@@ -657,9 +642,6 @@ class QcqpSolver():
             if abs(maxx) < 1e-8 and not options.mc_termination_check and not options.intermediate_mc:
                 param_values = dict([[id, param_var.x] for id, param_var in self._paramVars.items()])
                 return QcqpResult(self._pVars[initstate].x, param_values)
-
-
-
             # Updates the probability values for next iteration
             self._update_pinit(pvalues)
 
@@ -684,9 +666,9 @@ class QcqpSolver():
         # Constraint for initial state
         if options.threshold_constraint:
             if dir == "above":
-                self._encoding.addConstr(self._pVars[initstate] +self._tau[initstate] >= threshold)
+                self._encoding.addConstr(self._pVars[initstate] >= threshold)
             else:
-                self._encoding.addConstr(self._pVars[initstate] <= threshold +self._tau[initstate]  )
+                self._encoding.addConstr(self._pVars[initstate] <= threshold)
         self._wdconstraints(model, options)
         self._violation_constraints(model, options)
 
@@ -712,10 +694,6 @@ class QcqpSolver():
             self.encoding_timer += time.time() - encoding_start
 
             solved_properly = self._solve_model()
-            if time.time()-self._global_timer>self._timeout:
-                param_values = dict([[param_id, self._paraminit[param_id]] for param_id in self._paramVars.keys()])
-                print("Time out has elapsed after {} seconds:".format(self._timeout))
-                return QcqpResult(self._pinit[initstate], param_values), None
             if not solved_properly:
                 self._mu = options.mu
                 for param_id in self._paramVars.keys():
@@ -740,35 +718,35 @@ class QcqpSolver():
                 if abs(maxx) < 1e-8 and not options.mc_termination_check and not options.intermediate_mc:
                     param_values = dict([[id, param_var.x] for id, param_var in self._paramVars.items()])
                     return QcqpResult(self._pVars[initstate].x, param_values)
-
                 # Updates the probability values for next iteration
                 self._update_pinit(pvalues)
 
                 # Updates the parameter values for next iteration
                 for param_id, param_var in self._paramVars.items():
                     if not isinstance(param_var, int):
-                        if abs(param_var.x) > 0e-8:
+                        if abs(param_var.x) > 1e-8:
                             #  print pVar
                             self._paraminit[param_id] = param_var.x
                         else:
                             self._paraminit[param_id] = 0
-                #print(self._paraminit)
                 # Updates penalty parameter
                 self._mu += max(self._pinit)
                 if self._mu > 1e8:
                     self._mu = 1e8
+
             #print(self._encoding.getQConstrs())
 
             self._encoding.remove(self._encoding.getQConstrs())
             self._encoding.update()
             only_quadratic = True
+            break
 
 
 class QcqpModelRepairStats():
     def __init__(self):
         pass
 
-class QcqpModelRepair():
+class QcqpCvxModelRepair():
 
     def __init__(self, model_explorer):
         self._model_explorer = model_explorer
@@ -790,10 +768,6 @@ class QcqpModelRepair():
     @property
     def encoding_timer(self):
         return self._solver.encoding_timer
-    @property
-
-    def auxtimer2(self):
-        return self._solver._auxtimer2
 
     @property
     def iterations(self):
@@ -814,7 +788,7 @@ class QcqpModelRepair():
             self._property_type = "probability"
 
         self._model = self._model_explorer.get_model()
-        self._qcqp_options = QcqpOptions(mu=0.05, maxiter=1000000, graph_epsilon=1e-6, silent=not verbose, incremental=incremental, all_welldefined=all_welldefined, threshold_constraint = False,
+        self._qcqp_options = QcqpOptions(mu=0.05, maxiter=1, graph_epsilon=1e-6, silent=not verbose, incremental=incremental, all_welldefined=all_welldefined, threshold_constraint = False,
                                          store_quadratic=store_quadratic, mc_termination_check=(use_mc == "result_only"), intermediate_mc=(use_mc == "full"),
                                          minimise_violation=(handle_violation=="minimisation")
                                          )
@@ -852,16 +826,18 @@ class QcqpModelRepair():
         result = self._solver.run(self._model, self._variables, self._prob0, self._prob1, float(self._threshold), direction,
                                   self._qcqp_options, self._property_type, self._reward_name,
                                    lower_state_var_bounds, upper_state_var_bounds)
-        sample, mc_res = self._evaluate_result(result.parameter_values)
-        print("Qcqp: {}: Mc: {}".format(result.value_at_initial, float(mc_res[sample])))
-        print("iterations ={}".format(self._solver.iterations))
-        print("solver time={}".format(self._solver.solver_timer))
-        print("encoding time={}".format(self._solver.encoding_timer))
+        if result is not None:
+            sample, mc_res = self._evaluate_result(result.parameter_values)
+            print("Gurobi: {}: Mc: {}".format(result.value_at_initial, float(mc_res[sample])))
+            print("iterations ={}".format(self._solver.iterations))
+            print("solver time={}".format(self._solver.solver_timer))
+            print("encoding time={}".format(self._solver.encoding_timer))
 
-        print("iterate time={}".format(self._solver.iterate_timer))
-        print("inner part = {}s ({})".format(self._solver._auxtimer1, self._solver._auxtimer1/self._solver._auxtimer2))
-        print("adding constraints = {}s".format(self._solver._auxtimer3))
-        print("")
-        return InstantiationResult(sample, mc_res[sample])
+            print("iterate time={}".format(self._solver.iterate_timer))
+            print("inner part = {}s ({})".format(self._solver._auxtimer1, self._solver._auxtimer1/self._solver._auxtimer2))
+            print("adding constraints = {}s".format(self._solver._auxtimer3))
+            return InstantiationResult(sample, mc_res[sample])
+        else:
+            return None
 
 
